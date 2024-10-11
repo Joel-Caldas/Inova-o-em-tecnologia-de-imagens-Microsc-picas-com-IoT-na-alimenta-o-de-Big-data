@@ -1,0 +1,925 @@
+#include <WiFi.h>                                      // Biblioteca WiFi
+#include <time.h>                                      // Biblioteca Time para manipulação de data/hora
+#include <AsyncTCP.h>                                  // Biblioteca AsyncTCP usado pelo Web
+#include <ESPAsyncWebServer.h>                         // Biblioteca Asynch Web Server
+#include <ArduinoJson.h>                               // Biblioteca JSON para comunicação e parãmetros   
+#include <ESPmDNS.h>                                   // Biblioteca para inclusão do hostname no mDNS 
+#include <ESP32Servo.h>                                // Biblioteca para manipulação de servos
+#include <ElegantOTA.h>                                // Biblioteca para atualização via Web
+         
+//--------------------------------------
+// Camera libraries
+//--------------------------------------
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "driver/rtc_io.h"
+//-------------------------------------
+// Define os Pinos usados pelo programa
+//-------------------------------------
+#define pinWIFI     GPIO_NUM_33                        // Usado para ligar o LED se conectado no Wifi
+#define pinFLASH    GPIO_NUM_4                         // Usado para acionar o Flash
+#define pinPAN      GPIO_NUM_14                        // Usado para movimentar o Servo Horizontal
+#define pinTILT     GPIO_NUM_15                        // USado para movimentar o Servo Vertical
+//----------------------------------------------------------
+// Definição dos pinos para a câmera CAMERA_MODEL_AI_THINKER
+//----------------------------------------------------------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+//-----------------------------------------
+// Definições gerais
+//-----------------------------------------
+#define MAX_HORIZONTAL       180                       // Máximo Angulo Horizontal
+#define MAX_VERTICAL         90                        // Máximo Ângulo Vertical
+#define WS_ATRASO            120                       // Atraso para envio via web socket (ms)
+#define cleanupInterval      10                        // N. de passadas para chamar cleanupClients
+#define USER_UPDATE          "admin"                   // Usuário para atualização via OTA
+#define PASS_UPDATE          "esp32@cam"               // Senha para atualização via OTA
+#define timeoutWifi          15*1000                   // Timeout para reconhecimento do wifi ativo
+#define defaultDNSNAME       "camera"                  // Nome default para DNSNAME/HOSTNAME
+#define ESP_getChipId()   ((uint32_t)ESP.getEfuseMac() // Simular ID da placa ESP
+//---------------------------------------
+// Definições para Streaming
+//---------------------------------------
+String modo_streaming[2] = {"Iniciar", "Terminar"};    // Modo do Streaming
+unsigned lastFrame = 0;                                // Momento do último frame enviado  
+framesize_t default_resolution = FRAMESIZE_VGA;        // Resolução default
+                                                       // FRAMESIZE_UXGA 1600x1200 pixels
+                                                       // FRAMESIZE_SXGA 1280x1024 pixels
+                                                       // FRAMESIZE_XGA  1024x768  pixels
+                                                       // FRAMESIZE_SVGA 800x600   pixels
+                                                       // FRAMESIZE_VGA, 640x480   pixels
+                                                       // FRAMESIZE_QVGA 320x240   pixels
+                                                       // FRAMESIZE_CIF  352x288   pixels 
+//---------------------------------------
+// Definições da rede WiFi
+//---------------------------------------
+char ssid[]        = "Informe o SSID da sua Rede";     // Nome da rede Wifi 
+char password[]    = "Informe a senha da sua Rede";    // Senha da rede Wifi
+String dnsName     = defaultDNSNAME;                   // Nome default para DNS NAME
+//-------------------------------
+// Definições para o Servidor NTP
+//-------------------------------
+const char* NTP_SERVER = "a.st1.ntp.br";               // Dados do Servidor NTP do Brasil
+//const char* TZ_INFO  = "BRST+3BRDT+2,M10.3.0,M2.3.0";// Informações do Timezone do Brasil
+const char* TZ_INFO    = "<-03>3";                     // Fuso Horário do Brasil em relação ao GNT
+//-------------------------------
+// Definições Gerais do Programa
+//-------------------------------
+AsyncWebServer server(80);                             // Servidor http na porta 80
+AsyncWebSocket ws("/ws");                              // Socket para fazer streaming
+unsigned long disparo = 0;                             // Momento do disparo do Buzzer
+unsigned long ultimaDesconexao = 0;                    // Última desconeção do Wifi
+String modo_ligado[] = {"OFF", "ON"};                  // Estado ligado ON/OFF
+bool estado_cam = false;                               // Se a câmera foi inicilizada
+bool estado_flash = false;                             // Estado do Led Flash ON/OFF
+time_t startup;                                        // Horário da inicialização
+char esp_id[50];                                       // Id do ESP32CAM
+int panAngulo=0;                                       // Atual angulo do PAN (horizontal)
+int tiltAngulo=0;                                      // Atual angulo do TILT (vertical)
+int cleanupCounter = 0;                                // Contador de passadas para chamar cleanupClients()
+//-------------------------------
+// Definição dos Servos usados
+//-------------------------------
+Servo panServo;                                        // Servo para o movimento horizontal
+Servo tiltServo;                                       // Servo para o movimento vertical
+//---------------------------------------------
+// Variáveis para controle do OTA
+//---------------------------------------------
+bool autoRebootOTA     = true;                         // Se deve fazer autoreboot após a atualização OTA
+char user_OTA[16]      = USER_UPDATE;                  // Usuário para atualização OTA
+char pass_OTA[16]      = PASS_UPDATE;                  // Senha para atualização OTA
+//----------------------------------------
+// Define o HTML para fazer streaming
+//----------------------------------------
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>ESP32CAM Video Streaming</title>
+  <style>
+      body { font-family: Arial, sans-serif; font-size: 10px; margin: 0; padding: 0; background-color: #f4f4f4; overflow: hidden; }
+      .slider {
+          width: 80&percnt;;
+          margin: 20px auto;
+      }
+      input[type="range"] {
+          accent-color: blue; /* Define a cor do slider como azul */
+          width: 200px;
+          height: 10px;
+      }    
+      header { background-color: #333; color: #fff; text-align: center; padding: 1px; font-size: 16px;}    
+      p {font-size: 20px; color: #444444; margin-bottom: 10px;}
+      form, input, ol {font-size: 20px; color: #444444;}
+  
+      button {width: 120px; margin: 5px; padding: 10px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer;}
+      .btn-stream {
+        background-color: #4CAF50; /* Cor de fundo verde */
+        color: white; /* Cor do texto branco */
+        padding: 10px 20px; /* Preenchimento interno */
+        border: none; /* Sem borda */
+        cursor: pointer; /* Cursor de ponteiro ao passar o mouse */
+      }
+     .btn-update {
+       background-color: #0074E4; /* Cor de fundo azul */
+       color: white; /* Cor do texto branco */
+       padding: 10px 20px; /* Preenchimento interno */
+       border: none; /* Sem borda */
+      cursor: pointer; /* Cursor de ponteiro ao passar o mouse */
+     }      
+      
+      #stream-container {
+        justify-content: center;
+        align-items: center;
+        border: 2px solid #ccc; /* Cor e largura da borda */
+        padding: 10px; /* Adiciona algum espaço interno à borda */
+        display: inline-block; /* Faz com que a borda se ajuste ao tamanho do conteúdo */
+        overflow: hidden; /* Impede a barra de rolagem */
+      }
+  
+  
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 60px;
+        height: 34px;
+      }
+  
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+  
+      .slider-switch {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: #ccc;
+        transition: .4s;
+        border-radius: 34px;
+      }
+  
+      .slider-switch:before {
+        position: absolute;
+        content: "";
+        height: 26px;
+        width: 26px;
+        left: 4px;
+        bottom: 4px;
+        background-color: white;
+        transition: .4s;
+        border-radius: 50&percnt;;
+      }
+  
+      input:checked + .slider-switch {
+        background-color: #4CAF50;
+      }
+  
+      input:checked + .slider-switch:before {
+        transform: translateX(26px);
+      }
+  
+      .switch-container {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 10px 0;
+      }
+  
+      .switch-label {
+        margin-left: 10px;
+        font-size: 20px;
+        color: #444444;
+      }  
+  </style>
+</head>
+<body>
+  <header>
+    <h2>ESP32CAM PAN-TILT</h2>
+  </header>
+  <center>
+  <button id='toggleButton' onclick='toggleStreaming()' class='btn-stream'>Ativar</button>
+  <button onclick="acaoBotao('/update')" class='btn-update'>Atualizar</button><br>
+  <div class="switch-container">
+    <label class="switch">
+      <input type="checkbox" id="flashSwitch">
+      <span class="slider-switch"></span>
+    </label>
+    <span class="switch-label">Estado FLASH</span>
+  </div>
+  <div class="slider">
+      <label for="horizontalSlider">Ângulo Horizontal:</label><br>
+      <input type="range" id="horizontalSlider" min="0" max="%maxhorizontal%" value="%panangulo%">
+      <span id="horizontalValue">%panangulo%°</span>
+  </div>
+  <div class="slider">
+      <label for="verticalSlider">Ângulo Vertical:</label><br>
+      <input type="range" id="verticalSlider" min="0" max="%maxvertical%" value="%tiltangulo%">
+      <span id="verticalValue">%tiltangulo%°</span>
+  </div>  
+  <br>
+  <div id='stream-container'>
+    <img id="cameraFeed" src="http://your-camera-url" style="width: 280px; height: 140px;">
+
+  </div>
+  </center>
+  <script>
+    var socket;
+    let debounceTimeout;
+    const horizontalSlider=document.getElementById('horizontalSlider');
+    const horizontalValue=document.getElementById('horizontalValue');
+    const verticalSlider=document.getElementById('verticalSlider');
+    const verticalValue=document.getElementById('verticalValue');
+    const flashSwitch=document.getElementById('flashSwitch');
+    function formatToThreeDigits(value)
+    {
+       return String(value).padStart(3,'0');
+    }
+    
+    horizontalSlider.addEventListener('input', () => 
+    {
+        horizontalValue.textContent = `${horizontalSlider.value}°`;
+        clearTimeout(debounceTimeout);
+        debounceTimeout = setTimeout(() => {
+          socket.send(JSON.stringify({ type: 'hori', angle: formatToThreeDigits(horizontalSlider.value) }));
+        }, %WSATRASO%); // Ajuste o tempo de debounce conforme necessário
+    });
+    verticalSlider.addEventListener('input', () => 
+    {
+        verticalValue.textContent = `${verticalSlider.value}°`;
+        clearTimeout(debounceTimeout);
+        debounceTimeout = setTimeout(() => {
+            socket.send(JSON.stringify({ type: 'vert', angle: formatToThreeDigits(verticalSlider.value) }));
+        }, %WSATRASO%); // Ajuste o tempo de debounce conforme necessário
+    });
+    
+    flashSwitch.addEventListener('change',()=>
+    {
+       socket.send(JSON.stringify({type:'flash',flash:flashSwitch.checked}));
+    });
+    
+    function toggleStreaming()
+    {
+      var toggleButton=document.getElementById("toggleButton");
+      if(toggleButton.innerText==="Ativar")
+      {
+         initWebSocket();
+         toggleButton.innerText="Desativar";
+      }
+      else
+      {
+         toggleButton.innerText="Ativar";
+         stopStreaming();
+      }
+    }
+    
+    function initWebSocket()
+    {
+      if(!socket||socket.readyState===WebSocket.CLOSED)
+      {
+        socket=new WebSocket('ws://%iplocal%/ws');
+        socket.binaryType='arraybuffer';
+        
+        socket.onmessage=function(event)
+        {
+          var container=document.getElementById('stream-container');
+          var img=container.querySelector('img');
+          var tamanhoMinimo=Math.min(window.innerWidth,window.innerHeight);
+          
+          container.style.width=tamanhoMinimo+'px';
+          container.style.height=tamanhoMinimo+'px';
+          
+          if(img)
+          {
+            img.style.maxWidth=tamanhoMinimo+'px';
+            img.style.maxHeight=tamanhoMinimo+'px';
+            var arrayBuffer=event.data;
+            var blob=new Blob([new Uint8Array(arrayBuffer)],{type:'image/jpeg'});
+            img.src=URL.createObjectURL(blob);
+          }
+        };
+      }
+    }
+    
+    function stopStreaming()
+    {
+      if(socket&&socket.readyState!==WebSocket.CLOSED)
+      {
+        socket.close();
+      }
+    }
+     function acaoBotao(acao) 
+     {
+        window.location.href = acao;
+     }    
+    // Evento antes da página ser descarregada
+    
+    window.addEventListener('beforeunload',function()
+    {
+      stopStreaming();
+    });
+    
+  </script>
+</body>
+</html>
+)rawliteral";
+//--------------------------------
+// Prototipação das funções usadas
+//--------------------------------
+void WiFiEvent(WiFiEvent_t event);   // Trata os eventos do Wifi
+bool getNTPtime(int sec);            // Sincroniza o relógio interno com o servidor NTP
+bool configESPCamera();              // Inicializa a câmera do ESP32CAM
+String timeToString(time_t tempo);   // Formata uma variável time para string
+String getTimeStamp();               // Obtém a data no formato dd/mm/yyyy hh:mm:ss
+String processor(const String& var); // Faz a expansão de variáveis no HTML
+void displayRequest(AsyncWebServerRequest *request);  // Mostra informações da requisição na Console
+void capturarFrame();                // Captura e Envia o Frame via WebSocket
+bool setDNSNAME(String nome);        // Define o HostName como DNSNAME
+String getFrameSizeName(framesize_t size); // Devolve o nome da resolução da câmera
+//------------------------------------
+// Setup do ESP32CAM
+//------------------------------------
+void setup() 
+{
+  // Desabilita o brownout detector  
+   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+   // Inicializa a Serial
+   Serial.begin(115200);
+   while (!Serial) ;
+   // Define o Led da parte de trás no ESP32CAM. Será ligado pela rotina de
+   // eventos quando conectado no WiFi ou desligado quando fora 
+   pinMode(pinWIFI,OUTPUT);  
+   // Define o Led Frontal/Flash como output 
+   pinMode(pinFLASH, OUTPUT); 
+   // Attacha os servos
+   panServo.attach(pinPAN);
+   tiltServo.attach(pinTILT);
+   // Posiciona os servos a zero graus
+   panServo.write(panAngulo);
+   tiltServo.write(tiltAngulo);   
+   // Conecta-se à rede WiFi
+   Serial.print("Conectando ao Wi-Fi");
+   // Define o handle para tratar os eventos do Wifi
+   WiFi.onEvent(WiFiEvent);  
+   // Tenta a conexão WiFi
+  
+   WiFi.begin(ssid, password);
+   int cont=0;
+   while (WiFi.status() != WL_CONNECTED) 
+   {
+      if (++cont % 80 == 0) Serial.println();
+      else Serial.print(".");
+      delay(1000);
+   }
+   // Define o HostName para o servidor web para facilitar o acesso na rede local
+   // sem conhecer o IP previamente
+   Serial.print("Adicionando " + String(dnsName) + " no MDNS... ");
+   if (setDNSNAME(dnsName))
+   {
+       Serial.println("adicionado corretamente no MDNS!");
+   }
+   else 
+   {
+       Serial.println("Erro ao adicionar no MDNS!");
+   }
+   // Mostra as informações da rede Wifi
+  
+   Serial.print("\nConectado em ");
+   Serial.print(WiFi.SSID());
+   Serial.print(" no IP ");
+   Serial.print(WiFi.localIP());
+   Serial.print(" com MAC ");
+   Serial.print(WiFi.macAddress());   
+   Serial.print(" e sinal de ");
+   Serial.print(WiFi.RSSI());
+   Serial.println(" db");
+   // Sincroniza o horário interno com o Servidor NTP nacional
+   Serial.print("Tentando sincronismo com o servidor NTP ");
+   Serial.print(NTP_SERVER);
+   Serial.print(" com TimeZone ");
+   Serial.println(TZ_INFO);
+   configTime(0, 0, NTP_SERVER);
+   setenv("TZ", TZ_INFO, 1);
+   tzset();
+   if (getNTPtime(10))
+   { // espera 10sec para sincronizar
+      Serial.println("Relógio interno foi sincronizado com o servidor NTP");
+   } 
+   else 
+   {
+      Serial.println("\nErro ao atualizar o Relógio interno");
+   }  
+   // Inicializa a Câmera
+  
+   Serial.print("Inicializando a Câmera...");
+   estado_cam = configESPCamera();
+   if (estado_cam) Serial.println(" Camera OK!");
+   else Serial.println(" Falhou...");
+   // Define uma página inicial com links para listagem, transferência e acionamento do buzzer.
+  
+   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+   {
+      // Atende a requisição principal
+      displayRequest(request); 
+      request->send_P(200, "text/html", index_html, processor);
+  });
+  // Define uma página para links não encontrados
+  
+  server.onNotFound([](AsyncWebServerRequest *request)
+  {
+     // Atende a requisição NOT FOUND
+  
+     Serial.println("Requisição não encontrada");
+     displayRequest(request);
+  
+     // Retorna a mensagem de erro em caso de um retorno 404
+  
+     request->send(404, "text/html", "<h1>Erro: Requisi&ccedil;&atilde;o n&atilde;o encontrada</h1>");
+  });
+  // Inicializa o WebSocket Event para conectar/desconectar clientes de streaming
+  
+  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) 
+  {
+     // Registra na Console a conexão e desconexão de clientes socket's
+     if (type == WS_EVT_CONNECT) 
+     {
+        Serial.printf("Cliente Socket Id=%d conectado no IP %s\n",client->id(),client->remoteIP().toString());
+     } 
+     else if (type == WS_EVT_DISCONNECT) 
+     {
+        Serial.printf("Cliente Socket Id=%d desconectado do IP %s\n",client->id(),client->remoteIP().toString());
+        Serial.println(client->remoteIP()); 
+     }
+     else if (type == WS_EVT_DATA) 
+     {
+        // Trate os dados recebidos via WebSocket
+        data[len] = '\0'; 
+        String message = String((char*)data);
+        Serial.println("Mensagem recebida: " + message);
+        // Tratamento do JSON para extrair a movimentação dos Servos
+        JsonDocument json;
+        DeserializationError error = deserializeJson(json, message);
+        if (!error)
+        {
+           String tipo = json["type"].as<String>();
+           if (tipo.startsWith("flash"))
+           {
+              estado_flash = json["flash"].as<bool>();
+              digitalWrite(pinFLASH, estado_flash ? HIGH : LOW); 
+           }
+           else if (tipo.startsWith("hori")) 
+           {
+              panAngulo = json["angle"].as<int>();
+              panServo.write(panAngulo);
+           }
+           else if (tipo.startsWith("vert"))
+           {
+              tiltAngulo = json["angle"].as<int>();
+              tiltServo.write(tiltAngulo);
+          }
+        }
+        
+     }   
+  });  
+  // Adiciona o manipulador de WebSocket ao servidor
+  
+  server.addHandler(&ws);  
+  // Credenciais para atualizações via OTA
+   
+  ElegantOTA.setAuth(user_OTA,pass_OTA);
+  // Habilita/Desabilita AutoRebbot após a atualização
+   
+  ElegantOTA.setAutoReboot(autoRebootOTA);   
+  // Inicia o OTA para atualização via Web
+  ElegantOTA.begin(&server);      
+  // Inicia o servidor web
+  
+  server.begin();  
+  // Pega a hora do startup
+  time(&startup);
+  localtime(&startup);  
+  // Obtém o id do ESP32CAM
+  sprintf(esp_id, "%X",(uint32_t)ESP.getEfuseMac());
+  // Mostra o status de algumas variáveis no startup
+  Serial.print("Esp32 Serial  = "); Serial.println(esp_id);
+  Serial.print("Inicialização = "); Serial.println(timeToString(startup));
+  Serial.print("Data/Hora     = "); Serial.println(getTimeStamp());
+  Serial.print("Câmera        = "); Serial.println(modo_ligado[estado_cam]);
+  // Aguardando request http na porta 80
+  Serial.println("\nAguardando requisições http na porta 80...");
+  Serial.println("Use http://" + String(dnsName) + ".local no seu navegador...");  
+  Serial.println("Ou opcionalmente...");      
+  Serial.println("Use http://" + WiFi.localIP().toString() + " no seu navegador...\n");  
+  
+}
+//------------------------------------
+// Loop Principal
+//------------------------------------
+void loop() 
+{
+  // Verifica se está no modo streaming para capturar um frame e enviar via socket
+  if (estado_cam && ws.count() > 0)
+  {  
+     capturarFrame();
+     //lastFrame = millis();
+  }
+  
+  // Verifica se desconectou da Internet para tentar reconexão
+  if (WiFi.status() != WL_CONNECTED) 
+  {
+     // Tenta a conexão WiFi
+      
+     Serial.println("Tentando reconectar ao WiFi...");
+   
+     WiFi.begin(ssid, password);
+     unsigned long ultimaVez = millis();
+     int cont=0;
+  
+     while (WiFi.status() != WL_CONNECTED && (millis()-ultimaVez)<timeoutWifi) 
+     {
+        if (++cont % 80 == 0 ) Serial.println();
+        else Serial.print(".");
+     }
+     Serial.println( WiFi.status() == WL_CONNECTED ? "\nReconectado" : "\nReconexão Falhou" );      
+  }
+  // Verifica o OTA para saber se há atualização
+   ElegantOTA.loop();   
+  
+}
+//------------------------------------------------
+// Evento chamado no processo de conexão do Wifi
+//------------------------------------------------
+void WiFiEvent(WiFiEvent_t event)
+{
+  Serial.printf("[Evento Wi-Fi] evento: %d\n", event);
+  switch (event)
+  {
+    case SYSTEM_EVENT_WIFI_READY:
+      Serial.println("interface WiFi pronta");
+      break;
+    case SYSTEM_EVENT_SCAN_DONE:
+      Serial.println("Pesquisa por AP completada");
+      break;
+    case SYSTEM_EVENT_STA_START:
+      Serial.println("Cliente WiFi iniciado");
+      break;
+    case SYSTEM_EVENT_STA_STOP:
+      Serial.println("Clientes WiFi  cancelados");
+      break;
+    case SYSTEM_EVENT_STA_CONNECTED:
+      Serial.println("Conectado ao AP");
+      digitalWrite(pinWIFI,LOW);   // Liga o LED Vermelho para mostrar a conexão com WiFi (invertido)
+      break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+      Serial.println("Desconectado do AP WiFi");
+       digitalWrite(pinWIFI,HIGH); // Desliga o LED Vermelho para mostrar a desconexão com WiFi (invertido)
+      //Check_WiFiManager(false);
+      break;
+    case SYSTEM_EVENT_STA_AUTHMODE_CHANGE:
+      Serial.println("Modo de Autenticação do AP mudou");
+      break;
+    case SYSTEM_EVENT_STA_GOT_IP:
+      Serial.print("Endereço IP obtido: ");
+      Serial.println(WiFi.localIP());
+      break;
+    case SYSTEM_EVENT_STA_LOST_IP:
+      Serial.println("Endereço IP perdido e foi resetado para 0");
+      break;
+    case SYSTEM_EVENT_STA_WPS_ER_SUCCESS:
+      Serial.println("WPS: modo enrollee bem sucedido");
+      break;
+    case SYSTEM_EVENT_STA_WPS_ER_FAILED:
+      Serial.println("WPS: modo enrollee falhou");
+      break;
+    case SYSTEM_EVENT_STA_WPS_ER_TIMEOUT:
+      Serial.println("WPS: timeout no modo enrollee");
+      break;
+    case SYSTEM_EVENT_STA_WPS_ER_PIN:
+      Serial.println("WPS: pin code no modo enrollee");
+      break;
+    case SYSTEM_EVENT_AP_START:
+      Serial.println("AP Wifi Iniciado");
+      break;
+    case SYSTEM_EVENT_AP_STOP:
+      Serial.println("AP Wifi parado");
+      break;
+    case SYSTEM_EVENT_AP_STACONNECTED:
+      Serial.println("Cliente conectado");
+      break;
+    case SYSTEM_EVENT_AP_STADISCONNECTED:
+      Serial.println("Cliente desconectado");
+      break;
+    case SYSTEM_EVENT_AP_STAIPASSIGNED:
+      Serial.println("IP associado ao Cliente");
+      break;
+    case SYSTEM_EVENT_AP_PROBEREQRECVED:
+      Serial.println("Requisição de probe recebida");
+      break;
+    case SYSTEM_EVENT_GOT_IP6:
+      Serial.println("IPv6 é preferencial");
+      break;
+    case SYSTEM_EVENT_ETH_START:
+      Serial.println("Interface Ethernet iniciada");
+      break;
+    case SYSTEM_EVENT_ETH_STOP:
+      Serial.println("Interface Ethernet parada");
+      break;
+    case SYSTEM_EVENT_ETH_CONNECTED:
+      Serial.println("Interface Ethernet conectada");
+      break;
+    case SYSTEM_EVENT_ETH_DISCONNECTED:
+      Serial.println("Interface Ethernet desconectada");
+      break;
+    case SYSTEM_EVENT_ETH_GOT_IP:
+      Serial.println("Endereço IP obtido");
+      break;
+    default: break;
+  }
+}
+//---------------------------------------------------------
+// Sincroniza o horário do ESP32 com  NTP server brasileiro
+//---------------------------------------------------------
+bool getNTPtime(int sec) 
+{
+  {
+    uint32_t start = millis();
+    tm timeinfo;
+    time_t now;
+    int cont=0;
+    do 
+    {
+      time(&now);
+      localtime_r(&now, &timeinfo);
+      if (++cont % 80 == 0) Serial.println();
+      else Serial.print(".");
+      delay(10);
+    } while (((millis() - start) <= (1000 * sec)) && (timeinfo.tm_year < (2016 - 1900)));
+    if (timeinfo.tm_year <= (2016 - 1900)) return false;  // the NTP call was not successful
+    Serial.print("\nnow ");
+    Serial.println(now);
+    Serial.print("Time "); 
+    Serial.println(getTimeStamp());
+  }
+  return true;
+}
+//------------------------------------------------
+// Inicializa a Câmera para tirar fotos
+//------------------------------------------------
+bool configESPCamera() 
+{
+   // Objeto para configuração da Câmera
+   
+   camera_config_t config;
+   config.ledc_channel = LEDC_CHANNEL_0;
+   config.ledc_timer = LEDC_TIMER_0;
+   config.pin_d0 = Y2_GPIO_NUM;
+   config.pin_d1 = Y3_GPIO_NUM;
+   config.pin_d2 = Y4_GPIO_NUM;
+   config.pin_d3 = Y5_GPIO_NUM;
+   config.pin_d4 = Y6_GPIO_NUM;
+   config.pin_d5 = Y7_GPIO_NUM;
+   config.pin_d6 = Y8_GPIO_NUM;
+   config.pin_d7 = Y9_GPIO_NUM;
+   config.pin_xclk = XCLK_GPIO_NUM;
+   config.pin_pclk = PCLK_GPIO_NUM;
+   config.pin_vsync = VSYNC_GPIO_NUM;
+   config.pin_href = HREF_GPIO_NUM;
+   config.pin_sscb_sda = SIOD_GPIO_NUM;
+   config.pin_sscb_scl = SIOC_GPIO_NUM;
+   config.pin_pwdn = PWDN_GPIO_NUM;
+   config.pin_reset = RESET_GPIO_NUM;
+   config.xclk_freq_hz = 20000000;
+   config.pixel_format = PIXFORMAT_JPEG; // Choices are YUV422, GRAYSCALE, RGB565, JPEG
+   config.grab_mode = CAMERA_GRAB_LATEST;
+   // Seleciona a resolução da Câmera
+   
+   if (psramFound()) 
+   {
+      config.frame_size = default_resolution; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
+      config.jpeg_quality = 10;               //10-63 lower number means higher quality
+      config.fb_count = 2;
+   } 
+   else 
+   {
+      default_resolution = FRAMESIZE_SVGA;
+      config.frame_size = default_resolution;
+      config.jpeg_quality = 12;
+      config.fb_count = 2;
+   }
+   
+   Serial.print("Mode1 ");
+   Serial.print(getFrameSizeName(default_resolution));
+   Serial.print(" ...");   
+   // Inicializa a Câmera
+   
+   esp_err_t err = esp_camera_init(&config);
+   if (err != ESP_OK) 
+   {
+      Serial.printf("Camera init failed with error 0x%x", err);
+      return false;
+   }
+   // Faz ajuste nos parãmetros de qualidade da imagem
+   
+   sensor_t * s = esp_camera_sensor_get();
+   // BRIGHTNESS (-2 to 2)
+   s->set_brightness(s, 2); // era 2
+   // CONTRAST (-2 to 2)
+   s->set_contrast(s, 2);   // era 2
+   // SATURATION (-2 to 2)
+   s->set_saturation(s, -2);// era -2
+   // SPECIAL EFFECTS (0 - No Effect, 1 - Negative, 2 - Grayscale, 3 - Red Tint, 4 - Green Tint, 5 - Blue Tint, 6 - Sepia)
+   s->set_special_effect(s, 0);
+   // WHITE BALANCE (0 = Disable , 1 = Enable)
+   s->set_whitebal(s, 1);
+   // AWB GAIN (0 = Disable , 1 = Enable)
+   s->set_awb_gain(s, 1); 
+   // WB MODES (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
+   s->set_wb_mode(s, 0);
+   // EXPOSURE CONTROLS (0 = Disable , 1 = Enable)
+   s->set_exposure_ctrl(s, 1);
+   // AEC2 (0 = Disable , 1 = Enable)
+   s->set_aec2(s, 0);
+   // AE LEVELS (-2 to 2)
+   s->set_ae_level(s, 0);
+   // AEC VALUES (0 to 1200)
+   s->set_aec_value(s, 300);
+   // GAIN CONTROLS (0 = Disable , 1 = Enable)
+   s->set_gain_ctrl(s, 1);
+   // AGC GAIN (0 to 30)
+   s->set_agc_gain(s, 0);
+   // GAIN CEILING (0 to 6)
+   s->set_gainceiling(s, (gainceiling_t)0);
+   // BPC (0 = Disable , 1 = Enable)
+   s->set_bpc(s, 0);
+   // WPC (0 = Disable , 1 = Enable)
+   s->set_wpc(s, 1);
+   // RAW GMA (0 = Disable , 1 = Enable)
+   s->set_raw_gma(s, 1);
+   // LENC (0 = Disable , 1 = Enable)
+   s->set_lenc(s, 1);
+   // HORIZ MIRROR (0 = Disable , 1 = Enable)
+   s->set_hmirror(s, 0);
+   // VERT FLIP (0 = Disable , 1 = Enable)
+   s->set_vflip(s, 0); // era 0
+   // DCW (0 = Disable , 1 = Enable)
+   s->set_dcw(s, 1);
+   // COLOR BAR PATTERN (0 = Disable , 1 = Enable)
+   s->set_colorbar(s, 0);
+   return true;
+}
+//-------------------------------------------------------
+// Formata um variável time_t para string
+//-------------------------------------------------------
+String timeToString(time_t tempo)
+{
+   char timestamp[30];
+   strftime(timestamp, 30, "%d/%m/%Y %T", localtime(&tempo));  
+   return String(timestamp);
+}
+//------------------------------------------------
+// Devolve o localtime dd/mm/aaaa hh:mm:ss
+//------------------------------------------------
+String getTimeStamp()
+{
+  time_t now;
+  time(&now);
+  return String(timeToString(now));
+}
+//------------------------------------------------
+// Macro expansão dos HTML's
+//------------------------------------------------
+String processor(const String& var)
+{
+  //Serial.print("Var=");
+  //Serial.println(var);
+  if (var.equalsIgnoreCase("iplocal"))
+  {
+     return WiFi.localIP().toString();
+  }   
+  else if (var.equalsIgnoreCase("estadoflash"))
+  {
+     return estado_flash ? "checked" : "";
+  }  
+  else if (var.equalsIgnoreCase("maxhorizontal"))
+  {
+     return String(MAX_HORIZONTAL);
+  } 
+  else if (var.equalsIgnoreCase("maxvertical"))
+  {
+     return String(MAX_VERTICAL);
+  }   
+  else if (var.equalsIgnoreCase("panangulo"))
+  {
+     return String(panAngulo);
+  }   
+  else if (var.equalsIgnoreCase("tiltangulo"))
+  {
+     return String(tiltAngulo);
+  }   
+  else if (var.equalsIgnoreCase("wsatraso"))
+  {
+     return String(WS_ATRASO);
+  }     
+  return String();
+}
+//-------------------------------------------------------
+// Define o HostName como DNS NAME
+//-------------------------------------------------------
+bool setDNSNAME(String nome)
+{
+   WiFi.setHostname(nome.c_str());
+   bool ok = MDNS.begin(nome.c_str());
+   if (ok) MDNS.addService("http", "tcp", 80);      
+   return ok;
+}
+//-------------------------------------------------------
+// Devolve a resolução QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
+//-------------------------------------------------------
+String getFrameSizeName(framesize_t size) 
+{
+   switch (size) 
+   {
+       case FRAMESIZE_UXGA: return "UXGA-1600x1200";
+       case FRAMESIZE_SXGA: return "SXGA-1280x1024";
+       case FRAMESIZE_XGA:  return "XGA-1024x768";
+       case FRAMESIZE_SVGA: return "SVGA-800x600";
+       case FRAMESIZE_VGA:  return "VGA-640x480";
+       case FRAMESIZE_QVGA: return "QVGA-320x240";
+       case FRAMESIZE_CIF:  return "CIF-352x288";
+       default: return "Desconhecido";
+   }
+}
+//------------------------------------------------
+// Mostra informações da Requisição na Console
+//------------------------------------------------
+void displayRequest(AsyncWebServerRequest *request)
+{
+   Serial.print("Método: ");
+   Serial.print(request->methodToString());
+   Serial.print("\t| URL: ");
+   Serial.print(request->url());     
+   Serial.print("\t| IP: ");
+   Serial.println(request->client()->remoteIP());    
+   
+}
+//-------------------------------------------------------
+// Captura o Frame e envia via Websocket
+//-------------------------------------------------------
+void capturarFrame()
+{
+   //Serial.println("capturando um Frame...");
+   camera_fb_t * fb = NULL;
+   fb = esp_camera_fb_get();
+   if (!fb) 
+   {
+     Serial.println("Camera capture failed");
+     return;
+   } 
+   if(fb->format != PIXFORMAT_JPEG)
+   {
+      Serial.println("Formato não JPEG");
+      return;
+   }
+   
+   // Envia o frame
+   //Serial.print("Vou enviar via Socket...");
+   //Serial.println(ws.count());
+   ws.binaryAll(fb->buf, fb->len);
+   
+   //Serial.println("Foi enviado via Socket...");
+   // Cleanup final
+   esp_camera_fb_return(fb);
+   // Aguarde a entrega do frame para todos os clientes
+   // Obs: Só chamaremos a rotina cleanupClients a cada cleanupInterval
+   cleanupCounter = 0;
+   while (ws.count()>0 && !ws.availableForWriteAll())
+   {
+      cleanupCounter = (cleanupCounter+1) % cleanupInterval;
+      if (cleanupCounter == 0) 
+      {
+         ws.cleanupClients();
+      } 
+   }
+   
+}
