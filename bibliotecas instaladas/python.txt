@@ -1,0 +1,14 @@
+_______________________cmd__________________________
+pip install Pillow
+pip install requests
+____________________________________________________
+
+_____________________MICRO-front.py_________________
+import tkinter as tk
+from tkinter import filedialog
+from tkinter import messagebox
+from PIL import Image, ImageTk
+import requests
+import os
+import io 
+____________________________________________________
