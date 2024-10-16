@@ -4,31 +4,52 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MICRO-</title>
-     <style>
-        *{
+    <style>
+        * {
             margin: 0%;
             padding: 0%;
         }
-        body{
+        body {
             width: 100vw;
             height: 100vh;
-            overflow:hidden;
+            overflow: hidden;
         }
-        .box{
+        .box {
             display: flex;
         }
-        .box-button{
+        .box-button {
             display: flex;
             align-items: center;
             height: 60vh;
             width: 50vw;
-        }button{
+        }
+        .box-button button {
             height: 20%; 
             width: 10%; 
             border-radius: 100%; 
-            font-size: 200%; 
+            font-size: 3vw;
             background: #D9D9D9; 
             border: none;
+            cursor: pointer;
+        }
+        .button-baixar {
+            height: 16vh; 
+            width: 8vw;
+            border-top-left-radius: 10px;
+            border-bottom-left-radius: 10px;
+            font-size: 3vw;
+            background: #D9D9D9; 
+            border: none;
+            cursor: pointer;
+        }
+        .button-baixar img {
+            width: 5vw;
+            height: 10vh;
+        }
+        #armazenado-img img {
+            margin-right: 10px;
+            height: 100%;
+            width: auto;
         }
     </style>
 </head>
@@ -40,14 +61,49 @@
             <button id="button-esqueda" style="margin: 2%;">➡️</button>
             <button id="button-baixo" style="margin-top: 20%; margin-left: -24%;">⬇️</button>
         </div>
-        <img src="http://192.168.15.5:81/stream" alt="Stream da Câmera" style=" height: 80vh; width: 50vw;"/>
-        
-    </div>
-    <footer style="display: flex; position: absolute; bottom:0%; width: 100%; ">
-        <button style="cursor: pointer; border: none; height: 15vh; width: 10vw; margin-right: 2%; margin-left:2% ;">
-            <img src="./icons/pasta.png" alt="erro" style="height: 100%; width: auto;">
+        <button class="button-baixar" id="salvar-img">
+            <img src="https://img.icons8.com/?size=100&id=VGQlJM067vkN&format=png&color=000000" alt="Salvar Imagem">
         </button>
-        <div class="box-entrada-img" id="armazenado-img" style="background:  #D9D9D9; height: 15vh; width: 85vw;overflow-y: auto; display: flex; border-left: solid #000 2px;"></div>
+        <img id="stream-img" src="http://192.168.15.2:8080/stream" alt="Stream da Câmera" style="height: 80vh; width: 50vw;"/>
+    </div>
+    <footer style="display: flex; position: absolute; bottom: 0%; width: 100%;">
+        <button style="background: none; cursor: pointer; border: none; height: 15vh; width: 10vw; margin-right: 2%; margin-left: 2%;">
+            <img src="./icons/pasta.png" alt="Pasta" style="height: 100%; width: auto;">
+        </button>
+        <div class="box-entrada-img" id="armazenado-img" style="background: #D9D9D9; height: 15vh; width: 85vw; overflow-y: auto; display: flex; border-left: solid #000 2px; border-top: #000 solid 2px; border-top-left-radius: 10px;"></div>
     </footer>
+
+    <script>
+        document.getElementById("salvar-img").addEventListener("click", function() {
+            // Chama a função para salvar a imagem no MongoDB
+            fetch("http://192.168.15.2:8080/salvar-img")
+                .then(response => {
+                    if (response.ok) {
+                        console.log("Imagem salva com sucesso!");
+                        // Atualiza as imagens armazenadas
+                        atualizarImagens();
+                    } else {
+                        console.error("Falha ao salvar a imagem.");
+                    }
+                })
+                .catch(error => console.error("Erro ao fazer a requisição:", error));
+        });
+
+        function atualizarImagens() {
+            fetch("http://192.168.15.2:8080/imagens") // URL que retorna a lista de imagens do MongoDB
+                .then(response => response.json())
+                .then(data => {
+                    const divArmazenadoImg = document.getElementById("armazenado-img");
+                    divArmazenadoImg.innerHTML = ""; // Limpa o conteúdo atual
+
+                    data.forEach(imgData => {
+                        const img = document.createElement("img");
+                        img.src = imgData.url; // Supondo que cada objeto tenha uma propriedade 'url'
+                        divArmazenadoImg.appendChild(img);
+                    });
+                })
+                .catch(error => console.error("Erro ao obter imagens:", error));
+        }
+    </script>
 </body>
 </html>
